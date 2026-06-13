@@ -5577,8 +5577,8 @@ body.light-mode {
 
 
 /*AUTH GATE MODAL*/
-#authGateModal {
-  z-index: 9500;
+`#authGateModal` {
+  z-index: 11000;
 }
 
 .auth-gate-modal-content {
