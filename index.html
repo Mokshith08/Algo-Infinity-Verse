@@ -1206,21 +1206,21 @@
                       onclick="insertSnippet('function')"
                       title="Insert function"
                     >
-                      <i class="fas fa-code"></i> Function
+                      <i class="fas fa-code"></i><span class="btn-text"> Function</span>
                     </button>
                     <button
                       class="editor-btn"
                       onclick="formatCode()"
                       title="Format code"
                     >
-                      <i class="fas fa-indent"></i> Format
+                      <i class="fas fa-indent"></i><span class="btn-text"> Format</span>
                     </button>
                     <button
                       class="editor-btn"
                       onclick="toggleLineComment()"
                       title="Toggle comment"
                     >
-                      <i class="fas fa-comment"></i> //
+                      <i class="fas fa-comment"></i><span class="btn-text"> //</span>
                     </button>
                   </div>
                 </div>
@@ -1239,8 +1239,8 @@
                   <div class="syntax-highlight" id="syntaxHighlight"></div>
                 </div>
                 <div class="editor-shortcuts">
-                  <span><kbd>Ctrl</kbd>+<kbd>Enter</kbd> Run Code</span>
-                  <span><kbd>Ctrl</kbd>+<kbd>S</kbd> Submit</span>
+                  <span><kbd>Ctrl</kbd>+<kbd>Enter</kbd><span class="shortcut-label"> Run Code</span></span>
+                  <span><kbd>Ctrl</kbd>+<kbd>S</kbd><span class="shortcut-label"> Submit</span></span>
                 </div>
                 <div class="output-panel" id="outputPanel">
                   <div class="output-header" onclick="toggleOutputPanel()">
