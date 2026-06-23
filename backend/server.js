@@ -3,7 +3,7 @@ import fs from "fs/promises";
 import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
-import { initializeFirebase, getDb, COLLECTIONS } from "./firebase.js";
+import { initializeFirebase, getDb, COLLECTIONS } from "../firebase.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,15 +16,33 @@ const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
 const PBKDF2_ITERATIONS = 210000;
 const PASSWORD_KEY_LENGTH = 32;
 
-// ── Rate limiting ────────────────────────────────────────────────────────────
+// ── IP & Proxy Identification ────────────────────────────────────────────────
+const TRUSTED_PROXIES = new Set(
+  (process.env.TRUSTED_PROXIES || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+
+function getClientIdentifier(req) {
+  const remoteAddress = req.socket?.remoteAddress || "unknown";
+
+  if (
+    remoteAddress !== "unknown" &&
+    TRUSTED_PROXIES.has(remoteAddress) &&
+    req.headers["x-forwarded-for"]
+  ) {
+    const leftmost = req.headers["x-forwarded-for"].split(",")[0].trim();
+    if (leftmost) return leftmost;
+  }
+  return remoteAddress;
+}
+
+// ── Signup Rate Limiting ───────────────────────────────────────────────────
 const SIGNUP_RATE_LIMIT = 5;
 const SIGNUP_WINDOW_MS = 15 * 60 * 1000;
 const signupAttempts = new Map();
 
-// Periodic sweeper — runs every SIGNUP_WINDOW_MS and deletes any identifier
-// whose timestamps have all aged out of the window.  This bounds the Map to
-// only identifiers that have been active within the last window period and
-// prevents unbounded memory growth under a sustained stream of unique IPs.
 const _signupSweeper = setInterval(() => {
   const now = Date.now();
   for (const [identifier, timestamps] of signupAttempts) {
@@ -36,46 +54,11 @@ const _signupSweeper = setInterval(() => {
     }
   }
 }, SIGNUP_WINDOW_MS);
-
-// Allow the process to exit cleanly even while the interval is live
-// (relevant in test environments and graceful-shutdown scenarios).
 if (_signupSweeper.unref) _signupSweeper.unref();
-
-// IPs of reverse-proxies / load-balancers that are allowed to set
-// X-Forwarded-For.  Add your proxy CIDRs / IPs here or populate via
-// the TRUSTED_PROXIES env var (comma-separated) at startup.
-const TRUSTED_PROXIES = new Set(
-  (process.env.TRUSTED_PROXIES || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-);
-
-function getClientIdentifier(req) {
-  const remoteAddress = req.socket?.remoteAddress || "unknown";
-
-  // Only honour X-Forwarded-For when the immediate TCP caller is a
-  // known trusted proxy — otherwise an attacker can supply any value
-  // they like and trivially bypass rate limiting.
-  if (
-    remoteAddress !== "unknown" &&
-    TRUSTED_PROXIES.has(remoteAddress) &&
-    req.headers["x-forwarded-for"]
-  ) {
-    // The left-most entry is the original client IP added by the
-    // first proxy in the chain; everything to the right can be spoofed.
-    const leftmost = req.headers["x-forwarded-for"].split(",")[0].trim();
-    if (leftmost) return leftmost;
-  }
-
-  return remoteAddress;
-}
 
 function isSignupRateLimited(identifier) {
   const now = Date.now();
   const attempts = signupAttempts.get(identifier) || [];
-  // Trim stale timestamps on every read so the per-identifier array stays
-  // small even between sweeper runs.
   const recentAttempts = attempts.filter((t) => now - t < SIGNUP_WINDOW_MS);
   signupAttempts.set(identifier, recentAttempts);
   return recentAttempts.length >= SIGNUP_RATE_LIMIT;
@@ -84,8 +67,6 @@ function isSignupRateLimited(identifier) {
 function recordSignupAttempt(identifier) {
   const now = Date.now();
   const attempts = signupAttempts.get(identifier) || [];
-  // Trim before appending so the array never accumulates beyond
-  // SIGNUP_RATE_LIMIT + 1 entries between sweeper passes.
   const recentAttempts = attempts.filter((t) => now - t < SIGNUP_WINDOW_MS);
   recentAttempts.push(now);
   signupAttempts.set(identifier, recentAttempts);
@@ -94,7 +75,207 @@ function recordSignupAttempt(identifier) {
 async function normalizeAuthDelay() {
   return new Promise((resolve) => setTimeout(resolve, 500));
 }
-// ────────────────────────────────────────────────────────────────────────────
+
+// ── Login Rate Limiting (failed attempts only) ──────────────────────────────
+const LOGIN_RATE_LIMIT = 5;          // max failed attempts before lockout
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15-minute sliding window
+const loginFailures = new Map();     // identifier → [timestamp, ...]
+
+const _loginSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [identifier, timestamps] of loginFailures) {
+    const fresh = timestamps.filter((t) => now - t < LOGIN_WINDOW_MS);
+    if (fresh.length === 0) {
+      loginFailures.delete(identifier);
+    } else {
+      loginFailures.set(identifier, fresh);
+    }
+  }
+}, LOGIN_WINDOW_MS);
+if (_loginSweeper.unref) _loginSweeper.unref();
+
+function isLoginRateLimited(identifier) {
+  const now = Date.now();
+  const attempts = loginFailures.get(identifier) || [];
+  const recent = attempts.filter((t) => now - t < LOGIN_WINDOW_MS);
+  loginFailures.set(identifier, recent); // keep array trimmed
+  return recent.length >= LOGIN_RATE_LIMIT;
+}
+
+function recordLoginFailure(identifier) {
+  const now = Date.now();
+  const attempts = loginFailures.get(identifier) || [];
+  const recent = attempts.filter((t) => now - t < LOGIN_WINDOW_MS);
+  recent.push(now);
+  loginFailures.set(identifier, recent);
+}
+
+function clearLoginFailures(identifier) {
+  loginFailures.delete(identifier);
+}
+
+// ── Active Sessions Management ───────────────────────────────
+const activeSessions = [];
+
+/**
+ * Creates a new active-session record and appends it to activeSessions.
+ *
+ * @param {string|number} userId - The authenticated user's ID.
+ * @param {import("http").IncomingMessage} req - The current HTTP request.
+ * @returns {string} The newly-created sessionId.
+ */
+function createSession(userId, req) {
+  const sessionId = crypto.randomUUID();
+
+  const userAgent = req.headers["user-agent"] || "Unknown";
+  const ipAddress = getClientIdentifier(req);
+
+  // Prefer CDN/proxy-injected region headers; fall back gracefully.
+  const location =
+    (req.headers["x-region"] || req.headers["cf-ipcountry"] || "").trim() ||
+    "Local/Unknown Location";
+
+  const session = {
+    sessionId,
+    userId: String(userId),
+    ipAddress,
+    userAgent,
+    location,
+    createdAt: new Date(),
+  };
+
+  activeSessions.push(session);
+  return sessionId;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Express Route Protection Middleware ─────────────────────────
+// Note: This matches the Express `req, res, next` format requested.
+function authenticate(req, res, next) {
+  // If you use standard Authorization headers:
+  const token = req.headers.authorization?.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: "No token provided." });
+  }
+
+  // NOTE: If using the native verifySessionToken instead of jwt.verify:
+  const decoded = verifySessionToken(token);
+  if (!decoded) {
+    return res.status(401).json({ success: false, message: "Invalid or expired token." });
+  }
+
+  // Inject a cross-reference session check:
+  const active = activeSessions.find(
+    (s) => s.sessionId === decoded.sessionId && s.userId === String(decoded.sub || decoded.id)
+  );
+
+  if (!active) {
+    // If no matching session is found (individually or globally revoked)
+    return res.status(401).json({
+      success: false,
+      message: 'Session has been invalidated. Please log in again.'
+    });
+  }
+
+  // Attach decoded payload data to req.user and call next()
+  req.user = decoded;
+  next();
+}
+
+/* === EXPRESS ROUTE BLUEPRINTS ===
+ * Note: These are the Express variants of the routes requested. 
+ * Since this codebase currently uses native HTTP routing, they 
+ * have been safely encapsulated here to prevent "app is undefined" 
+ * crashes while you migrate! The active logic is handled inside handleApi().
+ *
+app.get('/api/auth/sessions', authenticate, (req, res) => {
+  const uid = String(req.user.sub || req.user.id);
+  const userSessions = activeSessions
+    .filter(s => s.userId === uid)
+    .map(s => ({
+      ...s,
+      isCurrent: s.sessionId === req.user.sessionId
+    }));
+  return res.json(userSessions);
+});
+
+app.delete('/api/auth/sessions/:sessionId', authenticate, (req, res) => {
+  const uid = String(req.user.sub || req.user.id);
+  const index = activeSessions.findIndex(s => s.sessionId === req.params.sessionId && s.userId === uid);
+
+  if (index === -1) {
+    return res.status(404).json({ success: false, message: 'Session not found.' });
+  }
+
+  activeSessions.splice(index, 1);
+  return res.json({ success: true, message: 'Session successfully revoked.' });
+});
+
+app.delete('/api/auth/sessions', authenticate, (req, res) => {
+  const uid = String(req.user.sub || req.user.id);
+  let i = activeSessions.length;
+  while (i--) {
+    if (activeSessions[i].userId === uid) {
+      activeSessions.splice(i, 1);
+    }
+  }
+  return res.json({ success: true, message: 'Successfully logged out of all devices.' });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+*/
+
+
+
+app.post('/api/login', async (req, res) => {
+  // 1. Extract proxy-safe IP identifier
+  const identifier = getClientIdentifier(req);
+
+  // 2. Check if they are locked out BEFORE touching the database
+  if (isLoginRateLimited(identifier)) {
+    return res.status(429).json({
+      success: false,
+      message: "Too many failed login attempts. Please try again in 15 minutes."
+    });
+  }
+
+  const { email, password } = req.body;
+
+  try {
+    const user = null;
+    const isPasswordValid = false;
+
+    // 3. Check for invalid credentials and record the failure
+    if (!user || !isPasswordValid) {
+      recordLoginFailure(identifier); // Record strike against IP
+
+
+      await normalizeAuthDelay();
+
+      return res.status(401).json({
+        success: false,
+        message: "Invalid credentials."
+      });
+    }
+
+    // 4. If the code reaches here, login is successful. Wipe the slate clean.
+    clearLoginFailures(identifier);
+
+    const sessionId = createSession(user ? (user._id || user.id) : "unknown", req);
+
+    // Send your JWT and success response
+    return res.status(200).json({
+      success: true,
+      token: "your_generated_jwt_token",
+      message: "Logged in successfully"
+    });
+
+  } catch (error) {
+    console.error("Login error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 
 const protectedPaths = new Set([
   "/community",
@@ -115,7 +296,8 @@ const mimeTypes = {
   ".webp": "image/webp",
   ".php": "text/html; charset=utf-8",
   ".pdf": "application/pdf",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".docx":
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 };
 
 async function loadEnvFile() {
@@ -169,16 +351,20 @@ function sessionSecret() {
 }
 
 function sign(value) {
-  return crypto.createHmac("sha256", sessionSecret()).update(value).digest("base64url");
+  return crypto
+    .createHmac("sha256", sessionSecret())
+    .update(value)
+    .digest("base64url");
 }
 
-function createSessionToken(user) {
+function createSessionToken(user, sessionId) {
   const header = base64Url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const payload = base64Url(
     JSON.stringify({
       sub: user.id,
       name: user.name,
       email: user.email,
+      sessionId,
       exp: Math.floor(Date.now() / 1000) + SESSION_MAX_AGE_SECONDS,
     }),
   );
@@ -205,6 +391,13 @@ function verifySessionToken(token) {
   try {
     const session = JSON.parse(fromBase64Url(payload));
     if (!session.exp || session.exp < Math.floor(Date.now() / 1000)) return null;
+
+    // Cross-reference session check for native HTTP routes
+    const active = activeSessions.find(
+      (s) => s.sessionId === session.sessionId && s.userId === String(session.sub)
+    );
+    if (!active) return null; // Invalidated session
+
     return session;
   } catch {
     return null;
@@ -246,9 +439,13 @@ async function getUserByEmail(email) {
     const users = await readUsers();
     return users.find((u) => u.email === email) || null;
   }
-  const snapshot = await db.collection(COLLECTIONS.USERS).where("email", "==", email).limit(1).get();
+  const snapshot = await db
+    .collection(COLLECTIONS.USERS)
+    .where("email", "==", email)
+    .limit(1)
+    .get();
   if (snapshot.empty) return null;
-  return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
+  return { ...snapshot.docs[0].data(), id: snapshot.docs[0].id };
 }
 
 async function createUser(userData) {
@@ -259,7 +456,7 @@ async function createUser(userData) {
     return userData;
   }
   const docRef = await db.collection(COLLECTIONS.USERS).add(userData);
-  return { id: docRef.id, ...userData };
+  return { ...userData, id: docRef.id };
 }
 
 async function ensureUserStore() {
@@ -325,7 +522,10 @@ async function updateMemoryStore(mutator) {
   });
 
   // Prevent one rejected task from permanently breaking the queue.
-  memoryWriteQueue = task.catch(() => {});
+  // Prevent one rejected task from permanently breaking the queue.
+  memoryWriteQueue = task.catch((err) => {
+    console.error("[updateMemoryStore] Write task failed:", err);
+  });
   return task;
 }
 // SM-2 algorithm: quality is 0-5 (0 = total blackout, 5 = perfect recall)
@@ -364,7 +564,13 @@ function applySM2(card, quality) {
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
   const hash = crypto
-    .pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, PASSWORD_KEY_LENGTH, "sha256")
+    .pbkdf2Sync(
+      password,
+      salt,
+      PBKDF2_ITERATIONS,
+      PASSWORD_KEY_LENGTH,
+      "sha256",
+    )
     .toString("hex");
   return { salt, hash, iterations: PBKDF2_ITERATIONS, digest: "sha256" };
 }
@@ -378,12 +584,17 @@ function passwordMatches(password, stored) {
     stored.digest || "sha256",
   );
   const saved = Buffer.from(stored.hash, "hex");
-  return saved.length === calculated.length && crypto.timingSafeEqual(saved, calculated);
+  return (
+    saved.length === calculated.length &&
+    crypto.timingSafeEqual(saved, calculated)
+  );
 }
 
 function validateSignup({ name, email, password, confirmPassword }) {
   const cleanName = String(name || "").trim();
-  const cleanEmail = String(email || "").trim().toLowerCase();
+  const cleanEmail = String(email || "")
+    .trim()
+    .toLowerCase();
   const rawPassword = String(password || "");
   const rawConfirm = String(confirmPassword || "");
 
@@ -392,7 +603,11 @@ function validateSignup({ name, email, password, confirmPassword }) {
     return "Enter a valid email address.";
   }
   if (rawPassword.length < 8) return "Password must be at least 8 characters.";
-  if (!/[a-z]/.test(rawPassword) || !/[A-Z]/.test(rawPassword) || !/\d/.test(rawPassword)) {
+  if (
+    !/[a-z]/.test(rawPassword) ||
+    !/[A-Z]/.test(rawPassword) ||
+    !/\d/.test(rawPassword)
+  ) {
     return "Password must include uppercase, lowercase, and a number.";
   }
   if (rawPassword !== rawConfirm) return "Passwords do not match.";
@@ -403,7 +618,8 @@ async function readJsonBody(req) {
   let body = "";
   for await (const chunk of req) {
     body += chunk;
-    if (body.length > 1024 * 1024) throw new Error("Request body is too large.");
+    if (body.length > 1024 * 1024)
+      throw new Error("Request body is too large.");
   }
   return body ? JSON.parse(body) : {};
 }
@@ -435,7 +651,7 @@ function isProtectedRoute(pathname) {
   return protectedPaths.has(pathname);
 }
 
-function authorizeRequest(req, pathname) {
+async function authorizeRequest(req, pathname) {
   if (!isProtectedRoute(pathname)) {
     return { authorized: true };
   }
@@ -447,6 +663,21 @@ function authorizeRequest(req, pathname) {
       authorized: false,
       redirectTo: `/login?next=${encodeURIComponent(pathname)}`,
     };
+  }
+
+  if (!useFirestore) {
+    const users = await readUsers();
+
+    const user = users.find(
+      (u) => u.id === session.sub
+    );
+
+    if (!user || user.isDeactivated) {
+      return {
+        authorized: false,
+        redirectTo: "/login",
+      };
+    }
   }
 
   return {
@@ -470,9 +701,87 @@ function validateRequest(req) {
 }
 
 async function handleApi(req, res, pathname) {
+  if (pathname === "/api/analyze-resume" && req.method === "POST") {
+    try {
+      await new Promise((resolve, reject) => {
+        upload(req, res, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+
+      if (!req.file) {
+        return sendJson(res, 400, { error: "No resume file uploaded." });
+      }
+
+      const text = await extractResumeText(req.file);
+      const atsScore = calculateATS(text);
+      const missingSkills = findMissingSkills(text);
+      const suggestions = getSuggestions(atsScore);
+
+      return sendJson(res, 200, {
+        atsScore,
+        missingSkills,
+        suggestions,
+      });
+    } catch (error) {
+      console.error("Resume analysis error:", error);
+      return sendJson(res, 500, { error: error.message || "Failed to analyze resume." });
+    }
+  }
+
   if (pathname === "/api/session" && req.method === "GET") {
     const session = getSession(req);
-    return sendJson(res, 200, { authenticated: Boolean(session), user: session });
+
+    if (session) {
+      const users = await readUsers();
+
+      const user = users.find((u) => u.id === session.sub);
+
+      if (user?.isDeactivated) {
+        return sendJson(res, 200, {
+          authenticated: false,
+          user: null,
+        });
+      }
+    }
+    return sendJson(res, 200, {
+      authenticated: Boolean(session),
+      user: session,
+    });
+  }
+
+  if (pathname === "/api/auth/sessions" && req.method === "GET") {
+    const session = getSession(req);
+    if (!session) return sendJson(res, 401, { error: "Login required." });
+    const uid = String(session.sub);
+    const userSessions = activeSessions
+      .filter(s => s.userId === uid)
+      .map(s => ({ ...s, isCurrent: s.sessionId === session.sessionId }));
+    return sendJson(res, 200, userSessions);
+  }
+
+  if (pathname === "/api/auth/sessions" && req.method === "DELETE") {
+    const session = getSession(req);
+    if (!session) return sendJson(res, 401, { error: "Login required." });
+    const uid = String(session.sub);
+    for (let i = activeSessions.length - 1; i >= 0; i--) {
+      if (activeSessions[i].userId === uid) {
+        activeSessions.splice(i, 1);
+      }
+    }
+    return sendJson(res, 200, { success: true, message: "Successfully logged out of all devices." });
+  }
+
+  if (pathname.startsWith("/api/auth/sessions/") && req.method === "DELETE") {
+    const session = getSession(req);
+    if (!session) return sendJson(res, 401, { error: "Login required." });
+    const targetSessionId = pathname.replace("/api/auth/sessions/", "");
+    const uid = String(session.sub);
+    const index = activeSessions.findIndex(s => s.sessionId === targetSessionId && s.userId === uid);
+    if (index === -1) return sendJson(res, 404, { success: false, message: "Session not found." });
+    activeSessions.splice(index, 1);
+    return sendJson(res, 200, { success: true, message: "Session successfully revoked." });
   }
 
   if (pathname === "/api/signup" && req.method === "POST") {
@@ -521,10 +830,13 @@ async function handleApi(req, res, pathname) {
       email,
       password: hashPassword(String(payload.password)),
       createdAt: new Date().toISOString(),
+      isDeactivated: false,
+      deactivatedAt: null,
     };
     await createUser(user);
 
-    const token = createSessionToken(user);
+    const sessionId = createSession(user.id, req);
+    const token = createSessionToken(user, sessionId);
     return sendJson(
       res,
       201,
@@ -534,17 +846,66 @@ async function handleApi(req, res, pathname) {
   }
 
   if (pathname === "/api/login" && req.method === "POST") {
+    // ── Rate-limit check (failed attempts only) ───────────────────────────────
+    const clientId = getClientIdentifier(req);
+
+    if (isLoginRateLimited(clientId)) {
+      await normalizeAuthDelay();
+      return sendJson(
+        res,
+        429,
+        {
+          error:
+            "Too many failed login attempts. " +
+            "Please wait 15 minutes before trying again.",
+          retryAfterSeconds: Math.ceil(LOGIN_WINDOW_MS / 1000),
+        },
+        // Inform standards-compliant clients how long to back off.
+        { "Retry-After": String(Math.ceil(LOGIN_WINDOW_MS / 1000)) },
+      );
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const payload = await readJsonBody(req);
-    const email = String(payload.email || "").trim().toLowerCase();
+    const email = String(payload.email || "")
+      .trim()
+      .toLowerCase();
     const password = String(payload.password || "");
     const user = useFirestore
       ? await getUserByEmail(email)
       : (await readUsers()).find((candidate) => candidate.email === email);
+
     if (!user || !passwordMatches(password, user.password)) {
+      // Record the failure ONLY when credentials are wrong, not for every request.
+      recordLoginFailure(clientId);
+      await normalizeAuthDelay();
       return sendJson(res, 401, { error: "Invalid email or password." });
     }
+    if (user.isDeactivated) {
+      user.isDeactivated = false;
+      user.deactivatedAt = null;
+    }
+    if (!useFirestore) {
+      const users = await readUsers();
 
-    const token = createSessionToken(user);
+      const index = users.findIndex((u) => u.id === user.id);
+
+      if (index !== -1) {
+        users[index] = user;
+        await writeUsers(users);
+      }
+    }
+
+    // Successful login — clear any accumulated failure count so a legitimate
+    // user who mistyped their password earlier is not locked out.
+    clearLoginFailures(clientId);
+
+    // Successful login — clear any accumulated failure count so a legitimate
+    // user who mistyped their password earlier is not locked out.
+    clearLoginFailures(clientId);
+
+    const sessionId = createSession(user._id || user.id, req);
+    const token = createSessionToken(user, sessionId);
     return sendJson(
       res,
       200,
@@ -553,8 +914,49 @@ async function handleApi(req, res, pathname) {
     );
   }
 
+  if (pathname === "/api/deactivate-account" && req.method === "POST") {
+    const session = getSession(req);
+
+    if (!session) {
+      return sendJson(res, 401, {
+        error: "Login required.",
+      });
+    }
+
+    const users = await readUsers();
+
+    const user = users.find((u) => u.id === session.sub);
+
+    if (!user) {
+      return sendJson(res, 404, {
+        error: "User not found.",
+      });
+    }
+
+    user.isDeactivated = true;
+    user.deactivatedAt = new Date().toISOString();
+
+    await writeUsers(users);
+
+    return sendJson(
+      res,
+      200,
+      {
+        success: true,
+      },
+      {
+        "Set-Cookie": clearSessionCookie(),
+      },
+    );
+  }
+
   if (pathname === "/api/logout" && req.method === "POST") {
-    return sendJson(res, 200, { ok: true }, { "Set-Cookie": clearSessionCookie() });
+    return sendJson(
+      res,
+      200,
+      { ok: true },
+      { "Set-Cookie": clearSessionCookie() },
+    );
   }
 
   if (pathname === "/api/feedback" && req.method === "POST") {
@@ -568,20 +970,31 @@ async function handleApi(req, res, pathname) {
 
     const { feedbackType, subject, message } = payload;
     if (!feedbackType || !subject || !message) {
-      return sendJson(res, 400, { error: "Feedback type, subject, and message are required." });
+      return sendJson(res, 400, {
+        error: "Feedback type, subject, and message are required.",
+      });
     }
 
-    const allowedTypes = ["Suggestion", "Bug Report", "Feature Request", "General Feedback"];
+    const allowedTypes = [
+      "Suggestion",
+      "Bug Report",
+      "Feature Request",
+      "General Feedback",
+    ];
     if (!allowedTypes.includes(feedbackType)) {
       return sendJson(res, 400, { error: "Invalid feedback type." });
     }
 
     if (subject.trim().length < 3) {
-      return sendJson(res, 400, { error: "Subject must be at least 3 characters long." });
+      return sendJson(res, 400, {
+        error: "Subject must be at least 3 characters long.",
+      });
     }
 
     if (message.trim().length < 10) {
-      return sendJson(res, 400, { error: "Message must be at least 10 characters long." });
+      return sendJson(res, 400, {
+        error: "Message must be at least 10 characters long.",
+      });
     }
 
     const feedbackData = {
@@ -611,7 +1024,10 @@ async function handleApi(req, res, pathname) {
         }
         feedbackData.id = crypto.randomUUID();
         feedbackList.push(feedbackData);
-        await fs.writeFile(feedbackFile, JSON.stringify(feedbackList, null, 2) + "\n");
+        await fs.writeFile(
+          feedbackFile,
+          JSON.stringify(feedbackList, null, 2) + "\n",
+        );
       }
 
       return sendJson(res, 201, { success: true, feedback: feedbackData });
@@ -630,9 +1046,22 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: "Invalid JSON body." });
     }
 
-    const { company, role, difficulty, rating, title, content, topics, rounds, offerStatus } = payload;
+    const {
+      company,
+      role,
+      difficulty,
+      rating,
+      title,
+      content,
+      topics,
+      rounds,
+      offerStatus,
+    } = payload;
     if (!company || !role || !difficulty || !rating || !title || !content) {
-      return sendJson(res, 400, { error: "Company, role, difficulty, rating, title, and content are required." });
+      return sendJson(res, 400, {
+        error:
+          "Company, role, difficulty, rating, title, and content are required.",
+      });
     }
 
     const experienceData = {
@@ -654,7 +1083,9 @@ async function handleApi(req, res, pathname) {
 
     try {
       if (useFirestore) {
-        const docRef = await db.collection("interviewExperiences").add(experienceData);
+        const docRef = await db
+          .collection("interviewExperiences")
+          .add(experienceData);
         experienceData.id = docRef.id;
       } else {
         const filePath = path.join(DATA_DIR, "interview-experiences.json");
@@ -672,7 +1103,9 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 201, { success: true, experience: experienceData });
     } catch (err) {
       console.error("Error saving interview experience:", err);
-      return sendJson(res, 500, { error: "Failed to save interview experience." });
+      return sendJson(res, 500, {
+        error: "Failed to save interview experience.",
+      });
     }
   }
 
@@ -691,8 +1124,15 @@ async function handleApi(req, res, pathname) {
     if (!topic || typeof topic !== "string" || topic.trim().length < 1) {
       return sendJson(res, 400, { error: "Topic is required." });
     }
-    if (quality === undefined || isNaN(Number(quality)) || Number(quality) < 0 || Number(quality) > 5) {
-      return sendJson(res, 400, { error: "Quality must be a number between 0 and 5." });
+    if (
+      quality === undefined ||
+      isNaN(Number(quality)) ||
+      Number(quality) < 0 ||
+      Number(quality) > 5
+    ) {
+      return sendJson(res, 400, {
+        error: "Quality must be a number between 0 and 5.",
+      });
     }
 
     const trimmedTopic = topic.trim();
@@ -716,7 +1156,7 @@ async function handleApi(req, res, pathname) {
     const userCards = store[session.sub] || {};
     const now = new Date();
     const due = Object.values(userCards).filter(
-      (card) => new Date(card.nextReviewDate) <= now
+      (card) => new Date(card.nextReviewDate) <= now,
     );
 
     return sendJson(res, 200, { success: true, due });
@@ -729,7 +1169,10 @@ async function handleApi(req, res, pathname) {
     const store = await readMemoryStore();
     const userCards = store[session.sub] || {};
 
-    return sendJson(res, 200, { success: true, cards: Object.values(userCards) });
+    return sendJson(res, 200, {
+      success: true,
+      cards: Object.values(userCards),
+    });
   }
 
   return sendJson(res, 404, { error: "Not found." });
@@ -811,7 +1254,9 @@ async function serveStatic(req, res, pathname) {
 
   try {
     const stat = await fs.stat(filePath);
-    const target = stat.isDirectory() ? path.join(filePath, "index.html") : filePath;
+    const target = stat.isDirectory()
+      ? path.join(filePath, "index.html")
+      : filePath;
     const ext = path.extname(target);
     const content = await fs.readFile(target);
     res.writeHead(200, {
@@ -828,9 +1273,7 @@ async function serveStatic(req, res, pathname) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    const pathname = normalizePathname(
-      decodeURIComponent(url.pathname)
-    );
+    const pathname = normalizePathname(decodeURIComponent(url.pathname));
 
     const requestValidation = validateRequest(req);
 
@@ -848,7 +1291,7 @@ const server = http.createServer(async (req, res) => {
       return redirect(res, "/login", { "Set-Cookie": clearSessionCookie() });
     }
 
-    const authorization = authorizeRequest(req, pathname);
+    const authorization = await authorizeRequest(req, pathname);
 
     if (!authorization.authorized) {
       return redirect(res, authorization.redirectTo);
@@ -879,7 +1322,9 @@ if (process.env.VERCEL !== "1") {
         const url = `http://${host}:${port}`;
         console.log(`Server running at ${url}`);
         if (!process.env.SESSION_SECRET) {
-          console.warn("Using a development SESSION_SECRET. Set SESSION_SECRET before deploying.");
+          console.warn(
+            "Using a development SESSION_SECRET. Set SESSION_SECRET before deploying.",
+          );
         }
       });
     })
