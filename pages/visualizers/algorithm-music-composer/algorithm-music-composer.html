@@ -10,21 +10,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Poppins:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
 
-    <!-- Theme Initialization Script -->
-    <script>
-      (function() {
-        try {
-          var storedTheme = localStorage.getItem('theme');
-          var prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
-          var theme = storedTheme || (prefersLight ? 'light' : 'dark');
-          if (theme === 'light') {
-            document.documentElement.classList.add('light-mode');
-          } else {
-            document.documentElement.classList.remove('light-mode');
-          }
-        } catch (e) {}
-      })();
-    </script>
+
 </head>
 <body data-page="algorithm-music-composer">
   <!-- Loading Screen -->
@@ -62,6 +48,12 @@
 
   <!-- Main Container -->
   <main class="container py-4">
+    <div class="print-export-bar">
+      <button id="exportPdfBtn" class="btn btn-primary print-export-btn" type="button" aria-label="Export current page as PDF">
+        <i class="fas fa-file-pdf"></i> Export to PDF
+      </button>
+    </div>
+
     
     <div class="row layout-row-gap">
       
@@ -124,15 +116,30 @@
 
           <!-- Playback Actions -->
           <div class="playback-actions border-top pt-3 mt-3">
-            <div class="flex gap-2">
-              <button id="btn-play" class="btn btn-primary flex-grow-1">
-                <i class="fas fa-play"></i> Start Sequence
+            <div class="mc-playback-grid">
+              <button id="btn-play" class="btn btn-primary mc-icon-btn" aria-label="Play sequence">
+                <i class="fas fa-play"></i>
               </button>
-              <button id="btn-reset" class="btn btn-secondary">
-                <i class="fas fa-arrow-rotate-left"></i> Reset
+              <button id="btn-pause" class="btn btn-outline mc-icon-btn" disabled aria-label="Pause sequence">
+                <i class="fas fa-pause"></i>
+              </button>
+              <button id="btn-reset" class="btn btn-secondary mc-icon-btn" aria-label="Reset sequence">
+                <i class="fas fa-rotate-left"></i>
               </button>
             </div>
+
+            <div class="mc-seq-progress mt-3" aria-hidden="true">
+              <div class="mc-seq-progress-top">
+                <span class="mc-seq-progress-label"><i class="fas fa-wave-square"></i> Sequence</span>
+                <span class="mc-seq-step-label" id="mc-seq-step-label">Step: 0</span>
+              </div>
+              <div class="mc-seq-progress-track">
+                <div class="mc-seq-progress-fill" id="mc-seq-progress-fill"></div>
+              </div>
+              <div class="mc-seq-timeline" id="mc-seq-timeline"></div>
+            </div>
           </div>
+
 
         </div>
       </div>
@@ -147,11 +154,13 @@
               <h4 class="m-0"><i class="fas fa-tv"></i> Execution Stage</h4>
               <div class="visualizer-status" id="composer-status-badge">Idle</div>
             </div>
-            <div class="card-body p-0 text-center position-relative" style="background: radial-gradient(circle at center, #111117 0%, #060609 100%);">
-              <div class="stage-container" style="width: 100%; height: 380px;">
-                <svg id="stage-svg" width="100%" height="100%"></svg>
+              <div class="card-body p-0 text-center position-relative" style="background: radial-gradient(circle at center, #111117 0%, #060609 100%);">
+                <div class="stage-container" style="width: 100%; height: 380px;">
+                  <div class="mc-note-indicator" id="mc-note-indicator" aria-hidden="true"></div>
+                  <svg id="stage-svg" width="100%" height="100%"></svg>
+                </div>
               </div>
-            </div>
+
           </div>
 
           <!-- Explanation Panel -->
@@ -177,7 +186,14 @@
 
   <script src="/auth.js"></script>
   <script src="/script.js"></script>
+  <script src="/theme.js"></script>
   <script src="./algorithm-music-composer.js"></script>
+
+  <script type="module">
+    import { initPrint } from "/modules/print.js";
+    initPrint();
+  </script>
+
 
   <script>
     loadPartial('navbar-placeholder', '/partials/navbar.html');

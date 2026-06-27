@@ -1,5 +1,5 @@
 import { initializeApp } from "firebase/app";
-import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import { getAuth, GoogleAuthProvider, signInWithRedirect, signOut, onAuthStateChanged, sendPasswordResetEmail } from "firebase/auth";
 
 let configPromise = null;
 let app = null;
@@ -44,13 +44,40 @@ async function ensureAuth() {
   return auth;
 }
 
+export async function getRedirectUser() {
+  const authInstance = await ensureAuth();
+
+  await new Promise((resolve) => {
+    const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+      if (user) {
+        unsubscribe();
+        resolve(user);
+      }
+    });
+
+    setTimeout(() => {
+      unsubscribe();
+      resolve(null);
+    }, 5000);
+  });
+
+  const user = authInstance.currentUser;
+  if (!user) return null;
+
+  try {
+    const idToken = await user.getIdToken(true);
+    return { idToken, user };
+  } catch (tokenError) {
+    console.warn("getIdToken after redirect failed:", tokenError);
+    return null;
+  }
+}
+
 export async function signInWithGoogle() {
   const authInstance = await ensureAuth();
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
-  const result = await signInWithPopup(authInstance, provider);
-  const idToken = await result.user.getIdToken();
-  return { idToken, user: result.user };
+  await signInWithRedirect(authInstance, provider);
 }
 
 export async function signOutUser() {
@@ -78,8 +105,22 @@ export async function getIdToken() {
   return currentUser.getIdToken();
 }
 
+export async function sendPasswordReset(email) {
+  const authInstance = await ensureAuth();
+  await sendPasswordResetEmail(authInstance, email);
+}
+
 export function isConfigured() {
   return auth !== null;
 }
 
-window.__firebaseClient = { signInWithGoogle, signOutUser, getCurrentUser, onAuthChange, getIdToken, isConfigured };
+window.__firebaseClient = {
+  signInWithGoogle,
+  getRedirectUser,
+  signOutUser,
+  getCurrentUser,
+  onAuthChange,
+  getIdToken,
+  sendPasswordReset,
+  isConfigured
+};

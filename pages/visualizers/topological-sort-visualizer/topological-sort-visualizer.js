@@ -18,31 +18,100 @@ let audioCtx = null;
 let isSoundEnabled = true;
 
 // DOM Elements
-const svg = document.getElementById("visualizerSvg");
-const edgeGroup = document.getElementById("svgEdges");
-const nodeGroup = document.getElementById("svgNodes");
-const placeholder = document.getElementById("canvasPlaceholder");
+// =========================
+// Required Elements Loader
+// =========================
+function loadRequiredElements() {
+  const idMap = {
+    svg: "visualizerSvg",
+    edgeGroup: "svgEdges",
+    nodeGroup: "svgNodes",
+    placeholder: "canvasPlaceholder",
+    presetSelect: "presetSelect",
+    algoSelect: "algoSelect",
+    speedRange: "speedRange",
+    speedDisplay: "speedDisplay",
+    soundToggle: "soundToggle",
+    startBtn: "startBtn",
+    pauseBtn: "pauseBtn",
+    stepBackBtn: "stepBackBtn",
+    stepForwardBtn: "stepForwardBtn",
+    resetBtn: "resetBtn",
+    canvasModeBadge: "canvasModeBadge",
+    validationBadge: "validationBadge",
+    validationAlert: "validationAlert",
+    alertTitle: "alertTitle",
+    alertDescription: "alertDescription",
+    activeStructureWrapper: "activeStructureWrapper",
+    structureTitle: "structureTitle",
+    auxiliaryTitle: "auxiliaryTitle",
+    auxiliaryStructureWrapper: "auxiliaryStructureWrapper",
+    topologicalTape: "topologicalTape",
+    logPanel: "logPanel",
+    clearLogsBtn: "clearLogsBtn"
+  };
 
-const modeBtns = document.querySelectorAll(".mode-btn");
-const presetSelect = document.getElementById("presetSelect");
-const algoSelect = document.getElementById("algoSelect");
-const speedRange = document.getElementById("speedRange");
-const speedDisplay = document.getElementById("speedDisplay");
-const soundToggle = document.getElementById("soundToggle");
+  const elements = {};
+  const missing = [];
 
-const startBtn = document.getElementById("startBtn");
-const pauseBtn = document.getElementById("pauseBtn");
-const stepBackBtn = document.getElementById("stepBackBtn");
-const stepForwardBtn = document.getElementById("stepForwardBtn");
-const resetBtn = document.getElementById("resetBtn");
+  for (const [key, id] of Object.entries(idMap)) {
+    const el = document.getElementById(id);
+    if (!el) missing.push(id);
+    elements[key] = el;
+  }
 
-const canvasModeBadge = document.getElementById("canvasModeBadge");
-const validationBadge = document.getElementById("validationBadge");
-const validationAlert = document.getElementById("validationAlert");
-const alertTitle = document.getElementById("alertTitle");
-const alertDescription = document.getElementById("alertDescription");
+  // mode buttons use querySelectorAll
+  elements.modeBtns = document.querySelectorAll('.mode-btn');
 
-const activeStructureWrapper = document.getElementById("activeStructureWrapper");
+  if (missing.length) {
+    // Hard-fail gracefully with a visible message instead of throwing later.
+    // (We still return partial elements to avoid breaking parsing entirely.)
+    console.error("Topological Sort Visualizer missing required DOM elements:", missing);
+    // If we can, show in validation alert area.
+    const validationAlertEl = document.getElementById("validationAlert");
+    const alertTitleEl = document.getElementById("alertTitle");
+    const alertDescriptionEl = document.getElementById("alertDescription");
+    if (validationAlertEl && alertTitleEl && alertDescriptionEl) {
+      validationAlertEl.className = "validation-alert-card cycle-detected";
+      alertTitleEl.textContent = "Visualizer UI not loaded";
+      alertDescriptionEl.textContent = `Missing UI elements: ${missing.join(", ")}. Please open the correct Topological Sort Visualizer page.`;
+      validationAlertEl.style.display = "flex";
+    }
+  }
+
+  return elements;
+}
+
+
+const {
+  svg,
+  edgeGroup,
+  nodeGroup,
+  placeholder,
+  modeBtns,
+  presetSelect,
+  algoSelect,
+  speedRange,
+  speedDisplay,
+  soundToggle,
+  startBtn,
+  pauseBtn,
+  stepBackBtn,
+  stepForwardBtn,
+  resetBtn,
+  canvasModeBadge,
+  validationBadge,
+  validationAlert,
+  alertTitle,
+  alertDescription,
+  activeStructureWrapper,
+  structureTitle,
+  auxiliaryTitle,
+  auxiliaryStructureWrapper,
+  topologicalTape,
+  logPanel,
+  clearLogsBtn
+} = loadRequiredElements();
 const structureTitle = document.getElementById("structureTitle");
 const auxiliaryTitle = document.getElementById("auxiliaryTitle");
 const auxiliaryStructureWrapper = document.getElementById("auxiliaryStructureWrapper");
@@ -137,11 +206,14 @@ function playSound(type) {
 
 // ===== GRAPH GRAPHICS DRAWING =====
 function renderGraph() {
+  if (!svg || !edgeGroup || !nodeGroup || !placeholder) return;
+
   if (nodes.length === 0) {
     placeholder.style.display = "block";
   } else {
     placeholder.style.display = "none";
   }
+
 
   // Clear layers
   edgeGroup.innerHTML = "";
@@ -1062,10 +1134,13 @@ function addLogEntry(text, type = "sys") {
   const entry = document.createElement("div");
   entry.className = `log-entry ${type}`;
   entry.innerHTML = `&gt; [${type.toUpperCase()}] ${text}`;
-  logPanel.appendChild(entry);
-  
-  // Auto-scroll logs
-  logPanel.scrollTop = logPanel.scrollHeight;
+  if (logPanel) {
+    logPanel.appendChild(entry);
+    
+    // Auto-scroll logs
+    logPanel.scrollTop = logPanel.scrollHeight;
+  }
+
 }
 
 // ===== EVENT LISTENERS =====

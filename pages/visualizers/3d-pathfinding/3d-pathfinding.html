@@ -6,16 +6,15 @@
     <title>3D Procedural Pathfinding | Algo Infinity Verse</title>
     <meta name="description" content="Visualize A* Pathfinding on dynamically generated 3D procedural terrain using WebGL." />
     
-    <link href="[https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Poppins:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap](https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Poppins:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap)" rel="stylesheet" />
-    <link rel="stylesheet" href="[https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css)" />
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Poppins:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
     
     <!-- External Stylesheets -->
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="/styles.css" />
     <link rel="stylesheet" href="3d-pathfinding.css" />
     
-    <!-- Three.js Library & OrbitControls -->
-    <script src="[https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js](https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js)"></script>
-    <script src="[https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js](https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js)"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 
     <!-- Theme Initialization Script -->
     <script>
@@ -69,7 +68,7 @@
 
                 <div class="settings-group">
                     <label>Algorithm Speed</label>
-                    <input type="range" id="speedSlider" min="1" max="50" value="20">
+                    <input type="range" id="speedSlider" min="1" max="50" value="20" aria-label="Algorithm Speed">
                 </div>
 
                 <div class="legend-box">
@@ -88,25 +87,26 @@
                     </div>
                     <div class="stat-row">
                         <span>Nodes Explored:</span>
-                        <strong class="text-accent" id="statExplored">0</strong>
+                        <strong class="text-accent" id="statExplored" aria-live="polite">0</strong>
                     </div>
                     <div class="stat-row">
                         <span>Path Cost:</span>
-                        <strong class="text-accent" id="statCost">0.00</strong>
+                        <strong class="text-accent" id="statCost" aria-live="polite">0.00</strong>
                     </div>
                 </div>
             </div>
         </div>
 
         <!-- 3D Canvas Container -->
-        <div class="canvas-wrapper" id="threejs-container">
-            <div class="camera-hint"><i class="fas fa-mouse"></i> Click & Drag to Rotate | Scroll to Zoom</div>
+        <div class="canvas-wrapper" id="threejs-container" aria-label="3D Pathfinding Terrain Canvas" role="region">
+            <p class="sr-only">A 3D representation of terrain where the A* algorithm visually searches for the optimal path.</p>
+            <div class="camera-hint" aria-hidden="true"><i class="fas fa-mouse"></i> Click & Drag to Rotate | Scroll to Zoom</div>
         </div>
 
     </main>
 
     <!-- External Scripts -->
-    <script src="script.js"></script>
+    <script src="/script.js"></script>
     <script src="3d-pathfinding.js"></script>
 </body>
 </html>

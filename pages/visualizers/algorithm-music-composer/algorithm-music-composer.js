@@ -23,6 +23,14 @@ let playbackTimer = null;
 let currentStepIdx = 0;
 let simulationSteps = [];
 
+// Sequence timeline UI
+let stepChips = [];
+let lastPlayedChipIdx = -1;
+
+// Visual sync
+let noteIndicatorTimeout = null;
+
+
 // Visualizer State data
 let activeVisualBars = [];
 let bfsGraphNodes = [];
@@ -305,7 +313,8 @@ function drawInitialStage() {
       const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
       txt.setAttribute("x", x + width/2);
       txt.setAttribute("y", 340);
-      txt.setAttribute("fill", "#71717a");
+      // Theme-aware: color is controlled by CSS via `currentColor`
+      txt.setAttribute("fill", "currentColor");
       txt.setAttribute("font-family", "'Fira Code', sans-serif");
       txt.setAttribute("font-size", "10px");
       txt.setAttribute("text-anchor", "middle");
